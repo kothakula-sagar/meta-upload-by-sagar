@@ -1,0 +1,41 @@
+services:
+  - type: web
+    name: meat-uploaded
+    runtime: node
+    plan: free
+    buildCommand: npm install && npm run build
+    startCommand: npm start
+    healthCheckPath: /api/health
+    envVars:
+      - key: NODE_VERSION
+        value: 22.19.0
+      - key: APP_TIMEZONE
+        value: Asia/Kolkata
+      - key: VITE_FIREBASE_PROJECT_ID
+        value: meta-upload-b46c8
+      - key: VITE_FIREBASE_AUTH_DOMAIN
+        value: meta-upload-b46c8.firebaseapp.com
+      - key: VITE_FIREBASE_STORAGE_BUCKET
+        value: meta-upload-b46c8.firebasestorage.app
+      - key: VITE_FIREBASE_MESSAGING_SENDER_ID
+        value: "740698572142"
+      - key: VITE_CLOUDINARY_CLOUD_NAME
+        value: nagb8qtj
+      - key: VITE_CLOUDINARY_UPLOAD_PRESET
+        value: meta-upload
+      - key: VITE_CLOUDINARY_FOLDER
+        value: meta-upload
+      - key: VITE_FIREBASE_API_KEY
+        sync: false
+      - key: VITE_FIREBASE_APP_ID
+        sync: false
+      - key: TELEGRAM_BOT_TOKEN
+        sync: false
+      - key: TELEGRAM_WEBHOOK_SECRET
+        sync: false
+      - key: CRON_SECRET
+        sync: false
+      - key: FIREBASE_CLIENT_EMAIL
+        sync: false
+      - key: FIREBASE_PRIVATE_KEY
+        sync: false
