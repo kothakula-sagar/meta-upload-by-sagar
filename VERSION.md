@@ -1,11 +1,13 @@
-# Meat Uploaded v2.0.0
+# Meat Uploaded v2.1.0
 
-- Replaced Firebase Cloud Functions Telegram backend with Render-compatible Node/Express `server.js`.
-- Added `.env.example`.
-- Moved Firebase Web config and Cloudinary config to Vite environment variables.
-- Set Cloudinary preset to `meta-upload`.
-- Added protected Telegram test endpoint using Firebase Auth ID tokens.
-- Added Telegram webhook and DONE callback handling.
-- Added scheduler one-shot command for Render Cron Jobs.
-- Added Render deployment configuration.
-- Removed Firebase Functions dependency from the project.
+Updated September 2026.
+
+## Changes
+- Telegram reminder schedules are now stored separately per entity.
+- Each entity has an independent Monday-Sunday schedule.
+- Post scheduling automatically uses the selected entity's weekday/time.
+- Server scheduler sends each entity's due posts independently.
+- Telegram messages include the entity-specific reminder time.
+- Calendar detects missing uploads for scheduled entities.
+- Render Blueprint includes a 5-minute scheduler Cron Job.
+- Telegram bot token remains server-side in Render environment variables.

@@ -56,7 +56,7 @@ export default function Home({ data, setPage }) {
                       post.status === "pending" ? "bg-amber-50 text-amber-700" :
                       "bg-slate-100 text-slate-600"
                     }`}>{post.status}</div>
-                    <div className="hidden text-right text-xs text-slate-400 sm:block">{post.scheduledTime || "From Settings"}</div>
+                    <div className="hidden text-right text-xs text-slate-400 sm:block">{(() => { const entityData = data.entities.find(e => e.id === post.entityId); const day = new Date(`${post.scheduledDate}T12:00:00`).getDay(); const key = ["sunday","monday","tuesday","wednesday","thursday","friday","saturday"][day]; return entityData?.telegramSchedule?.[key]?.time || post.scheduledTime || "Not configured"; })()}</div>
                   </div>
                 );
               })}
@@ -75,7 +75,7 @@ export default function Home({ data, setPage }) {
           <div className="mt-5 space-y-3">
             <Setup label="Create entities" done={data.entities.length > 0} onClick={() => setPage("entities")} />
             <Setup label="Connect Telegram" done={Boolean(data.telegram?.chatId)} onClick={() => setPage("telegram")} />
-            <Setup label="Set weekly reminder" done={Object.values(data.settings?.schedule || {}).some(v => v?.enabled)} onClick={() => setPage("settings")} />
+            <Setup label="Set entity Telegram schedules" done={data.entities.length > 0 && data.entities.every(entity => Object.values(entity.telegramSchedule || {}).some(v => v?.enabled))} onClick={() => setPage("settings")} />
           </div>
         </section>
       </div>

@@ -16,6 +16,7 @@ const PROJECT_ID = process.env.FIREBASE_PROJECT_ID || "meta-upload-b46c8";
 const TELEGRAM_BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN || "";
 const TELEGRAM_WEBHOOK_SECRET = process.env.TELEGRAM_WEBHOOK_SECRET || "";
 const CRON_SECRET = process.env.CRON_SECRET || "";
+const PUBLIC_BASE_URL = String(process.env.PUBLIC_BASE_URL || "").replace(/\/$/, "");
 
 function required(name, value) {
   if (!value) throw new Error(`${name} is not configured.`);
@@ -65,6 +66,22 @@ async function telegramRequest(method, body) {
   return data;
 }
 
+async function configureTelegramWebhook() {
+  if (!PUBLIC_BASE_URL || !TELEGRAM_BOT_TOKEN) return;
+
+  const webhookUrl = `${PUBLIC_BASE_URL}/api/telegram/webhook`;
+  try {
+    await telegramRequest("setWebhook", {
+      url: webhookUrl,
+      secret_token: TELEGRAM_WEBHOOK_SECRET || undefined,
+      allowed_updates: ["callback_query"]
+    });
+    console.log(`Telegram webhook configured: ${webhookUrl}`);
+  } catch (error) {
+    console.error("Telegram webhook setup failed:", error.message);
+  }
+}
+
 function nowInIndia() {
   const parts = new Intl.DateTimeFormat("en-GB", {
     timeZone: TZ,
@@ -91,30 +108,11 @@ function getDownloadName(service, entity) {
 
 async function sendScheduledReminders() {
   const current = nowInIndia();
-  const [settingsSnap, telegramSnap] = await Promise.all([
-    db.doc("settings/general").get(),
-    db.doc("telegram/primary").get()
-  ]);
-
-  if (!settingsSnap.exists || !telegramSnap.exists) {
-    return { sent: 0, reason: "Telegram or schedule settings are not configured." };
-  }
-
-  const settings = settingsSnap.data() || {};
+  const telegramSnap = await db.doc("telegram/primary").get();
   const chatId = String(telegramSnap.data()?.chatId || "");
-  const daySetting = settings.schedule?.[current.day];
 
-  if (!chatId || !daySetting?.enabled || !daySetting.time) {
-    return { sent: 0, reason: "No enabled Telegram schedule for today." };
-  }
-
-  const [hour, minute] = String(daySetting.time).split(":").map(Number);
-  const configuredTotal = hour * 60 + minute;
-  const [currentHour, currentMinute] = current.time.split(":").map(Number);
-  const currentTotal = currentHour * 60 + currentMinute;
-
-  if (currentTotal < configuredTotal) {
-    return { sent: 0, reason: `Scheduled time ${daySetting.time} has not arrived.` };
+  if (!chatId) {
+    return { sent: 0, date: current.date, time: current.time, reason: "Telegram chat ID is not configured." };
   }
 
   const postsSnap = await db.collection("posts")
@@ -123,22 +121,60 @@ async function sendScheduledReminders() {
     .get();
 
   let sent = 0;
+  let skipped = 0;
+
   for (const postDoc of postsSnap.docs) {
     const post = postDoc.data();
+    const entityId = String(post.entityId || "");
+
+    if (!entityId) {
+      skipped += 1;
+      continue;
+    }
+
     const [entitySnap, serviceSnap] = await Promise.all([
-      db.doc(`entities/${post.entityId}`).get(),
+      db.doc(`entities/${entityId}`).get(),
       post.serviceId ? db.doc(`services/${post.serviceId}`).get() : Promise.resolve(null)
     ]);
 
-    const entity = entitySnap?.exists ? entitySnap.data().name : "Unknown entity";
-    const service = serviceSnap?.exists ? serviceSnap.data().name : "General / No specific service";
+    if (!entitySnap.exists) {
+      skipped += 1;
+      continue;
+    }
+
+    const entityData = entitySnap.data() || {};
+    const entity = entityData.name || "Unknown entity";
+    const entitySchedule = entityData.telegramSchedule || {};
+    const daySetting = entitySchedule[current.day];
+
+    // Every entity has its own weekly schedule. A post is sent only when
+    // its entity's configured time for today's weekday has arrived.
+    if (!daySetting?.enabled || !daySetting.time) {
+      skipped += 1;
+      continue;
+    }
+
+    const [hour, minute] = String(daySetting.time).split(":").map(Number);
+    const configuredTotal = hour * 60 + minute;
+    const [currentHour, currentMinute] = current.time.split(":").map(Number);
+    const currentTotal = currentHour * 60 + currentMinute;
+
+    if (!Number.isFinite(configuredTotal) || currentTotal < configuredTotal) {
+      skipped += 1;
+      continue;
+    }
+
+    const service = serviceSnap?.exists
+      ? serviceSnap.data()?.name || "General / No specific service"
+      : "General / No specific service";
 
     const text = [
       "<b>📢 TODAY'S INSTAGRAM POST</b>",
       "",
       `<b>Entity:</b> ${escapeHtml(entity)}`,
       `<b>Service:</b> ${escapeHtml(service)}`,
-      `<b>Scheduled:</b> ${escapeHtml(post.scheduledDate)} · ${escapeHtml(post.scheduledTime || daySetting.time)}`,
+      `<b>Reminder time:</b> ${escapeHtml(daySetting.time)}`,
+      `<b>Date:</b> ${escapeHtml(post.scheduledDate)}`,
       "",
       "<b>Description:</b>",
       escapeHtml(post.description || "—"),
@@ -146,8 +182,11 @@ async function sendScheduledReminders() {
       "<b>Hashtags:</b>",
       escapeHtml(post.hashtags || "—"),
       "",
-      `🖼 <a href="${escapeHtml(post.imageUrl || "")}">Open Cloudinary image</a>`,
+      post.imageUrl
+        ? `🖼 <a href="${escapeHtml(post.imageUrl)}">Open Cloudinary image</a>`
+        : "🖼 Image link is unavailable.",
       "",
+      `⏰ ${escapeHtml(entity)} reminder time has arrived.`,
       "Manually post this image to Instagram, then press DONE below."
     ].join("\n");
 
@@ -164,14 +203,22 @@ async function sendScheduledReminders() {
 
     await postDoc.ref.update({
       status: "pending",
-      reminderSentAt: FieldValue.serverTimestamp()
+      reminderSentAt: FieldValue.serverTimestamp(),
+      reminderScheduledTime: daySetting.time,
+      reminderDay: current.day
     });
+
     sent += 1;
   }
 
-  return { sent, date: current.date, time: current.time };
+  return {
+    sent,
+    skipped,
+    date: current.date,
+    time: current.time,
+    day: current.day
+  };
 }
-
 async function verifySuperAdmin(req, res, next) {
   try {
     const header = req.headers.authorization || "";
@@ -301,5 +348,6 @@ if (process.argv.includes("--scheduler-once")) {
 } else {
   app.listen(PORT, "0.0.0.0", () => {
     console.log(`Meat Uploaded server listening on port ${PORT}`);
+    configureTelegramWebhook();
   });
 }

@@ -40,6 +40,7 @@ export async function createEntity(name, description = "") {
     name,
     description,
     active: true,
+    telegramSchedule: null,
     createdAt: serverTimestamp()
   });
 }

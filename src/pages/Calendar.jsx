@@ -22,8 +22,11 @@ export default function Calendar({data}) {
     const completed=posts.some(p=>p.status==="completed");
     const pending=posts.some(p=>["scheduled","pending"].includes(p.status));
     const dow=(new Date(year,monthIndex,d).getDay()+6)%7;
-    const enabled=data.settings?.schedule?.[dayKeys[dow]]?.enabled;
-    const tone=today ? "bg-stone-100 border-stone-200" : completed ? "bg-emerald-50 border-emerald-200" : posts.length ? "bg-slate-50 border-slate-200" : enabled ? "bg-rose-50 border-rose-200" : "bg-white border-slate-200";
+    const scheduledEntities = data.entities.filter(entity => entity.telegramSchedule?.[dayKeys[dow]]?.enabled);
+    const postEntityIds = new Set(posts.map(post => post.entityId));
+    const hasMissingEntityUpload = scheduledEntities.some(entity => !postEntityIds.has(entity.id));
+    const enabled = scheduledEntities.length > 0;
+    const tone=today ? "bg-stone-100 border-stone-200" : completed ? "bg-emerald-50 border-emerald-200" : posts.length ? (hasMissingEntityUpload ? "bg-rose-50 border-rose-200" : "bg-slate-50 border-slate-200") : enabled ? "bg-rose-50 border-rose-200" : "bg-white border-slate-200";
 
     cells.push(
       <div key={key} className={`min-h-[110px] rounded-xl border p-2.5 ${tone}`}>
@@ -41,7 +44,7 @@ export default function Calendar({data}) {
 
   return <div className="space-y-5">
     <div className="flex flex-col justify-between gap-3 sm:flex-row sm:items-center">
-      <div><h2 className="text-xl font-bold tracking-tight">Calendar</h2><p className="mt-1 text-sm text-slate-400">Green = completed · stone = today · red = scheduled day without an upload.</p></div>
+      <div><h2 className="text-xl font-bold tracking-tight">Calendar</h2><p className="mt-1 text-sm text-slate-400">Green = completed · stone = today · red = at least one entity has a reminder schedule but no upload.</p></div>
       <div className="flex items-center gap-2">
         <button onClick={()=>setMonth(new Date(year,monthIndex-1,1))} className="grid h-9 w-9 place-items-center rounded-xl border border-slate-200 bg-white"><ChevronLeft size={16}/></button>
         <div className="min-w-36 text-center text-sm font-bold">{month.toLocaleDateString("en-IN",{month:"long",year:"numeric"})}</div>

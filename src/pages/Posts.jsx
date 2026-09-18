@@ -52,6 +52,8 @@ export default function Posts({ data, refresh, notify }) {
 function PostCard({post,data,onDelete}) {
   const entity = data.entities.find(e=>e.id===post.entityId)?.name || "Unknown entity";
   const service = data.services.find(s=>s.id===post.serviceId)?.name || "General / No specific service";
+  const postDay = post.scheduledDate ? dayKeys[new Date(`${post.scheduledDate}T12:00:00`).getDay()] : null;
+  const reminderTime = postDay ? (data.entities.find(e => e.id === post.entityId)?.telegramSchedule?.[postDay]?.time || post.scheduledTime || "Not configured") : (post.scheduledTime || "Not configured");
   const statusClass =
     post.status === "completed" ? "bg-emerald-50 text-emerald-700" :
     post.status === "pending" ? "bg-amber-50 text-amber-700" :
@@ -68,7 +70,7 @@ function PostCard({post,data,onDelete}) {
         <p className="mt-3 line-clamp-2 text-xs leading-5 text-slate-500">{post.description || "No description"}</p>
         <div className="mt-4 space-y-1 text-[11px] text-slate-400">
           <div>Uploaded · {post.uploadedAt?.toDate ? post.uploadedAt.toDate().toLocaleString("en-IN") : "Just now"}</div>
-          <div>Scheduled · {post.scheduledDate} · {post.scheduledTime || "From Settings"}</div>
+          <div>Scheduled · {post.scheduledDate} · {reminderTime}</div>
         </div>
         <div className="mt-4 flex gap-2 border-t border-slate-100 pt-3">
           <a href={post.imageUrl} target="_blank" rel="noreferrer" download={getDownloadName(service,entity)} className="flex flex-1 items-center justify-center gap-2 rounded-xl border border-slate-200 px-3 py-2 text-xs font-bold text-slate-600 hover:bg-slate-50"><Download size={14}/> Download</a>
@@ -95,7 +97,11 @@ function PostForm({data,close,refresh,notify}) {
     return dayKeys[new Date(`${date}T12:00:00`).getDay()];
   }, [date]);
 
-  const daySetting = selectedDay ? data.settings?.schedule?.[selectedDay] : null;
+  const selectedEntity = data.entities.find(entity => entity.id === entityId);
+  const legacySchedule = data.settings?.schedule || {};
+  const daySetting = selectedDay
+    ? (selectedEntity?.telegramSchedule?.[selectedDay] || legacySchedule[selectedDay] || null)
+    : null;
   const reminderTime = daySetting?.enabled ? daySetting.time : "";
 
   async function submit(e) {
@@ -103,7 +109,7 @@ function PostForm({data,close,refresh,notify}) {
     if (!file) return notify("Please select an image.","error");
     if (!entityId) return notify("Please select an entity.","error");
     if (!daySetting?.enabled || !reminderTime) {
-      return notify(`No upload time is enabled for ${selectedDay || "this date"}. Configure it in Settings first.`, "error");
+      return notify(`No Telegram time is enabled for ${selectedEntity?.name || "this entity"} on ${selectedDay || "this date"}. Configure that entity in Settings first.`, "error");
     }
 
     setSaving(true);
@@ -130,7 +136,7 @@ function PostForm({data,close,refresh,notify}) {
   }
 
   return (
-    <Modal title="Create scheduled post" subtitle="The reminder time comes automatically from Settings for the selected day." onClose={close}>
+    <Modal title="Create scheduled post" subtitle="The reminder time comes automatically from the selected entity's Settings schedule." onClose={close}>
       <form onSubmit={submit} className="space-y-4 p-5">
         <Field label="Entity *">
           <select className="field" value={entityId} onChange={e=>setEntityId(e.target.value)} required>
@@ -174,7 +180,7 @@ function PostForm({data,close,refresh,notify}) {
             <div className="text-lg font-black text-slate-900">{reminderTime || "Not configured"}</div>
           </div>
           <p className={`mt-2 text-xs ${daySetting?.enabled ? "text-slate-400" : "text-rose-600"}`}>
-            {daySetting?.enabled ? "Taken directly from Settings. No second time field is required." : `Enable ${selectedDay || "this day"} in Settings before scheduling this post.`}
+            {daySetting?.enabled ? "Taken directly from this entity's Settings. No second time field is required." : `Enable ${selectedDay || "this day"} for ${selectedEntity?.name || "this entity"} in Settings before scheduling this post.`}
           </p>
         </div>
 

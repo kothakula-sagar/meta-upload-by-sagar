@@ -105,24 +105,21 @@ The test endpoint requires a valid Firebase Authentication ID token, then the se
 
 ### Webhook
 
-After deploying to Render, set:
+After deploying to Render, set `PUBLIC_BASE_URL` to your Render URL, for example:
+
+```text
+https://meat-uploaded.onrender.com
+```
+
+On startup, `server.js` automatically calls Telegram `setWebhook` and configures:
 
 ```text
 https://YOUR-RENDER-DOMAIN/api/telegram/webhook
 ```
 
-as the Telegram webhook.
+The webhook uses `TELEGRAM_WEBHOOK_SECRET` when configured and accepts callback-query updates for the Telegram DONE button. Telegram webhooks deliver HTTPS POST updates to your endpoint. urlTelegram Bot APIhttps://core.telegram.org/bots/api
 
-Telegram webhooks deliver HTTPS POST updates to your endpoint. urlTelegram Bot APIhttps://core.telegram.org/bots/api
-
-Example from a secure terminal:
-
-```bash
-curl -X POST "https://api.telegram.org/botYOUR_BOT_TOKEN/setWebhook" \
-  -d "url=https://YOUR-RENDER-DOMAIN/api/telegram/webhook" \
-  -d "secret_token=YOUR_TELEGRAM_WEBHOOK_SECRET" \
-  -d 'allowed_updates=["callback_query"]'
-```
+You therefore do not need to manually call `setWebhook` after every deployment.
 
 Do not put the real token in GitHub, README, or frontend code.
 
@@ -201,3 +198,32 @@ For a larger production application, tighten the rules to the intended admin UID
 - If there is exactly one service, it is used automatically
 - If there is no service, `General / No specific service` is used
 - Reminder time is taken from Settings based on the selected weekday
+
+## Per-entity Telegram scheduling
+
+Telegram reminder times are stored on each entity in the `telegramSchedule` field. Each entity has an independent Monday-Sunday schedule.
+
+Example:
+
+```text
+Abra Logistics
+  Monday 10:00
+
+Abra Global Shipping
+  Monday 14:00
+```
+
+A post inherits the selected entity's reminder time for the weekday of its scheduled date. The post form has no separate time input. If the entity's schedule is changed later, the scheduler uses the latest entity schedule when deciding when to send the reminder.
+
+The Telegram message contains the entity, service, reminder time, scheduled date, description, hashtags, Cloudinary image link, and a `DONE — POSTED TO INSTAGRAM` button. Clicking DONE changes the Firestore post status to `completed`.
+
+## Render scheduler
+
+The included `render.yaml` defines two Render services:
+
+- `meat-uploaded`: Node web service serving the React build and API.
+- `meat-uploaded-scheduler`: Render Cron Job running `npm run scheduler` every 5 minutes.
+
+Render cron expressions use UTC. The application converts the current time to `Asia/Kolkata` before comparing it with each entity's configured schedule. Render documents cron jobs as a separate service type and notes that cron schedules are UTC. urlRender Cron Jobshttps://render.com/docs/cronjobs
+
+The scheduler is intentionally a one-shot process so each cron run starts, checks all entity schedules, sends due reminders, and exits.
