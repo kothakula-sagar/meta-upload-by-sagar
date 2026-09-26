@@ -17,6 +17,11 @@ const TELEGRAM_BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN || "";
 const TELEGRAM_WEBHOOK_SECRET = process.env.TELEGRAM_WEBHOOK_SECRET || "";
 const CRON_SECRET = process.env.CRON_SECRET || "";
 const PUBLIC_BASE_URL = String(process.env.PUBLIC_BASE_URL || "").replace(/\/$/, "");
+const ALLOWED_ORIGINS = String(process.env.ALLOWED_ORIGINS || PUBLIC_BASE_URL)
+  .split(",")
+  .map(value => value.trim())
+  .filter(Boolean);
+const SCHEDULER_STALE_MINUTES = Number(process.env.SCHEDULER_STALE_MINUTES || 10);
 
 function required(name, value) {
   if (!value) throw new Error(`${name} is not configured.`);
@@ -54,26 +59,37 @@ function escapeHtml(value) {
 
 async function telegramRequest(method, body) {
   const token = required("TELEGRAM_BOT_TOKEN", TELEGRAM_BOT_TOKEN);
-  const response = await fetch(`https://api.telegram.org/bot${token}/${method}`, {
-    method: "POST",
-    headers: { "content-type": "application/json" },
-    body: JSON.stringify(body)
-  });
-  const data = await response.json().catch(() => ({}));
-  if (!response.ok || !data.ok) {
-    throw new Error(data.description || `Telegram API returned HTTP ${response.status}.`);
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), 15000);
+
+  try {
+    const response = await fetch(`https://api.telegram.org/bot${token}/${method}`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify(body),
+      signal: controller.signal
+    });
+    const data = await response.json().catch(() => ({}));
+    if (!response.ok || !data.ok) {
+      throw new Error(data.description || `Telegram API returned HTTP ${response.status}.`);
+    }
+    return data;
+  } finally {
+    clearTimeout(timeout);
   }
-  return data;
 }
 
 async function configureTelegramWebhook() {
-  if (!PUBLIC_BASE_URL || !TELEGRAM_BOT_TOKEN) return;
+  if (!PUBLIC_BASE_URL || !TELEGRAM_BOT_TOKEN) {
+    console.log("Telegram webhook setup skipped: PUBLIC_BASE_URL or TELEGRAM_BOT_TOKEN is missing.");
+    return;
+  }
 
   const webhookUrl = `${PUBLIC_BASE_URL}/api/telegram/webhook`;
   try {
     await telegramRequest("setWebhook", {
       url: webhookUrl,
-      secret_token: TELEGRAM_WEBHOOK_SECRET || undefined,
+      ...(TELEGRAM_WEBHOOK_SECRET ? { secret_token: TELEGRAM_WEBHOOK_SECRET } : {}),
       allowed_updates: ["callback_query"]
     });
     console.log(`Telegram webhook configured: ${webhookUrl}`);
@@ -102,8 +118,65 @@ function nowInIndia() {
   };
 }
 
+function minutesFromHHMM(value) {
+  const match = /^(\d{2}):(\d{2})$/.exec(String(value || ""));
+  if (!match) return null;
+  const hour = Number(match[1]);
+  const minute = Number(match[2]);
+  if (hour > 23 || minute > 59) return null;
+  return hour * 60 + minute;
+}
+
+function isDue(scheduledDate, scheduledTime, current) {
+  if (scheduledDate !== current.date) return false;
+  const scheduledMinutes = minutesFromHHMM(scheduledTime);
+  const currentMinutes = minutesFromHHMM(current.time);
+  return scheduledMinutes !== null && currentMinutes !== null && currentMinutes >= scheduledMinutes;
+}
+
 function getDownloadName(service, entity) {
   return `${service || "General"} of ${entity || "Entity"} by sagar`;
+}
+
+async function isSuperAdminUid(uid) {
+  if (!uid) return false;
+  const snap = await db.doc(`admins/${uid}`).get();
+  const data = snap.data() || {};
+  return snap.exists && data.active === true && data.role === "super_admin";
+}
+
+async function claimPost(postRef, current) {
+  const claim = await db.runTransaction(async transaction => {
+    const snap = await transaction.get(postRef);
+    if (!snap.exists) return false;
+    const post = snap.data() || {};
+
+    if (post.status === "scheduled") {
+      if (!isDue(post.scheduledDate, post.scheduledTime, current)) return false;
+      transaction.update(postRef, {
+        status: "sending",
+        sendingStartedAt: FieldValue.serverTimestamp(),
+        schedulerClaimedAt: FieldValue.serverTimestamp()
+      });
+      return true;
+    }
+
+    if (post.status === "sending" && post.sendingStartedAt?.toMillis) {
+      const ageMs = Date.now() - post.sendingStartedAt.toMillis();
+      if (ageMs >= SCHEDULER_STALE_MINUTES * 60 * 1000 && isDue(post.scheduledDate, post.scheduledTime, current)) {
+        transaction.update(postRef, {
+          status: "sending",
+          sendingStartedAt: FieldValue.serverTimestamp(),
+          schedulerClaimedAt: FieldValue.serverTimestamp(),
+          retryCount: FieldValue.increment(1)
+        });
+        return true;
+      }
+    }
+
+    return false;
+  });
+  return claim;
 }
 
 async function sendScheduledReminders() {
@@ -112,123 +185,132 @@ async function sendScheduledReminders() {
   const chatId = String(telegramSnap.data()?.chatId || "");
 
   if (!chatId) {
-    return { sent: 0, date: current.date, time: current.time, reason: "Telegram chat ID is not configured." };
+    return { sent: 0, skipped: 0, failed: 0, date: current.date, time: current.time, reason: "Telegram chat ID is not configured." };
   }
 
-  const postsSnap = await db.collection("posts")
-    .where("scheduledDate", "==", current.date)
-    .where("status", "==", "scheduled")
-    .get();
+  // Keep these as two simple queries so Firestore does not require a composite index.
+  const [scheduledSnap, sendingSnap] = await Promise.all([
+    db.collection("posts").where("scheduledDate", "==", current.date).where("status", "==", "scheduled").get(),
+    db.collection("posts").where("scheduledDate", "==", current.date).where("status", "==", "sending").get()
+  ]);
+  const candidateDocs = [...scheduledSnap.docs, ...sendingSnap.docs];
 
   let sent = 0;
   let skipped = 0;
+  let failed = 0;
 
-  for (const postDoc of postsSnap.docs) {
-    const post = postDoc.data();
-    const entityId = String(post.entityId || "");
+  console.log(`[scheduler] ${current.date} ${current.time} ${TZ} - found ${candidateDocs.length} candidate post(s)`);
 
-    if (!entityId) {
+  for (const postDoc of candidateDocs) {
+    const post = postDoc.data() || {};
+    const scheduledTime = String(post.scheduledTime || "");
+
+    if (!isDue(post.scheduledDate, scheduledTime, current)) {
       skipped += 1;
+      console.log(`[scheduler] skip ${postDoc.id}: scheduled for ${post.scheduledDate} ${scheduledTime}`);
       continue;
     }
 
-    const [entitySnap, serviceSnap] = await Promise.all([
-      db.doc(`entities/${entityId}`).get(),
-      post.serviceId ? db.doc(`services/${post.serviceId}`).get() : Promise.resolve(null)
-    ]);
-
-    if (!entitySnap.exists) {
+    const claimed = await claimPost(postDoc.ref, current);
+    if (!claimed) {
       skipped += 1;
+      console.log(`[scheduler] skip ${postDoc.id}: already claimed or no longer due`);
       continue;
     }
 
-    const entityData = entitySnap.data() || {};
-    const entity = entityData.name || "Unknown entity";
-    const entitySchedule = entityData.telegramSchedule || {};
-    const daySetting = entitySchedule[current.day];
+    try {
+      const entityId = String(post.entityId || "");
+      if (!entityId) throw new Error("Post has no entityId.");
 
-    // Every entity has its own weekly schedule. A post is sent only when
-    // its entity's configured time for today's weekday has arrived.
-    if (!daySetting?.enabled || !daySetting.time) {
-      skipped += 1;
-      continue;
+      const [entitySnap, serviceSnap] = await Promise.all([
+        db.doc(`entities/${entityId}`).get(),
+        post.serviceId ? db.doc(`services/${post.serviceId}`).get() : Promise.resolve(null)
+      ]);
+
+      if (!entitySnap.exists) throw new Error("Entity no longer exists.");
+
+      const entityData = entitySnap.data() || {};
+      const entity = entityData.name || "Unknown entity";
+      const service = serviceSnap?.exists
+        ? serviceSnap.data()?.name || "General / No specific service"
+        : "General / No specific service";
+
+      const text = [
+        "<b>📢 TODAY'S INSTAGRAM POST</b>",
+        "",
+        `<b>Entity:</b> ${escapeHtml(entity)}`,
+        `<b>Service:</b> ${escapeHtml(service)}`,
+        `<b>Reminder time:</b> ${escapeHtml(scheduledTime)}`,
+        `<b>Date:</b> ${escapeHtml(post.scheduledDate)}`,
+        "",
+        "<b>Description:</b>",
+        escapeHtml(post.description || "—"),
+        "",
+        "<b>Hashtags:</b>",
+        escapeHtml(post.hashtags || "—"),
+        "",
+        post.imageUrl
+          ? `🖼 <a href="${escapeHtml(post.imageUrl)}">Open Cloudinary image</a>`
+          : "🖼 Image link is unavailable.",
+        "",
+        `⏰ ${escapeHtml(entity)} reminder time has arrived.`,
+        "Manually post this image to Instagram, then press DONE below."
+      ].join("\n");
+
+      await telegramRequest("sendMessage", {
+        chat_id: chatId,
+        text,
+        parse_mode: "HTML",
+        reply_markup: {
+          inline_keyboard: [[
+            { text: "✓ DONE — POSTED TO INSTAGRAM", callback_data: `done:${postDoc.id}` }
+          ]]
+        }
+      });
+
+      await postDoc.ref.update({
+        status: "pending",
+        reminderSentAt: FieldValue.serverTimestamp(),
+        reminderScheduledTime: scheduledTime,
+        reminderDay: current.day,
+        lastSchedulerError: FieldValue.delete(),
+        sendingStartedAt: FieldValue.delete(),
+        schedulerClaimedAt: FieldValue.delete()
+      });
+
+      sent += 1;
+      console.log(`[scheduler] SENT ${postDoc.id} -> ${entity} at ${scheduledTime}`);
+    } catch (error) {
+      failed += 1;
+      console.error(`[scheduler] FAILED ${postDoc.id}:`, error.message);
+      await postDoc.ref.update({
+        status: "scheduled",
+        lastSchedulerError: String(error.message || "Telegram delivery failed").slice(0, 500),
+        lastSchedulerErrorAt: FieldValue.serverTimestamp(),
+        sendingStartedAt: FieldValue.delete(),
+        schedulerClaimedAt: FieldValue.delete(),
+        retryCount: FieldValue.increment(1)
+      }).catch(updateError => console.error(`[scheduler] Could not restore ${postDoc.id}:`, updateError.message));
     }
-
-    const [hour, minute] = String(daySetting.time).split(":").map(Number);
-    const configuredTotal = hour * 60 + minute;
-    const [currentHour, currentMinute] = current.time.split(":").map(Number);
-    const currentTotal = currentHour * 60 + currentMinute;
-
-    if (!Number.isFinite(configuredTotal) || currentTotal < configuredTotal) {
-      skipped += 1;
-      continue;
-    }
-
-    const service = serviceSnap?.exists
-      ? serviceSnap.data()?.name || "General / No specific service"
-      : "General / No specific service";
-
-    const text = [
-      "<b>📢 TODAY'S INSTAGRAM POST</b>",
-      "",
-      `<b>Entity:</b> ${escapeHtml(entity)}`,
-      `<b>Service:</b> ${escapeHtml(service)}`,
-      `<b>Reminder time:</b> ${escapeHtml(daySetting.time)}`,
-      `<b>Date:</b> ${escapeHtml(post.scheduledDate)}`,
-      "",
-      "<b>Description:</b>",
-      escapeHtml(post.description || "—"),
-      "",
-      "<b>Hashtags:</b>",
-      escapeHtml(post.hashtags || "—"),
-      "",
-      post.imageUrl
-        ? `🖼 <a href="${escapeHtml(post.imageUrl)}">Open Cloudinary image</a>`
-        : "🖼 Image link is unavailable.",
-      "",
-      `⏰ ${escapeHtml(entity)} reminder time has arrived.`,
-      "Manually post this image to Instagram, then press DONE below."
-    ].join("\n");
-
-    await telegramRequest("sendMessage", {
-      chat_id: chatId,
-      text,
-      parse_mode: "HTML",
-      reply_markup: {
-        inline_keyboard: [[
-          { text: "✓ DONE — POSTED TO INSTAGRAM", callback_data: `done:${postDoc.id}` }
-        ]]
-      }
-    });
-
-    await postDoc.ref.update({
-      status: "pending",
-      reminderSentAt: FieldValue.serverTimestamp(),
-      reminderScheduledTime: daySetting.time,
-      reminderDay: current.day
-    });
-
-    sent += 1;
   }
 
-  return {
-    sent,
-    skipped,
-    date: current.date,
-    time: current.time,
-    day: current.day
-  };
+  return { sent, skipped, failed, date: current.date, time: current.time, day: current.day };
 }
+
 async function verifySuperAdmin(req, res, next) {
   try {
     const header = req.headers.authorization || "";
     if (!header.startsWith("Bearer ")) return res.status(401).json({ error: "Authentication required." });
     const token = header.slice(7);
     const decoded = await auth.verifyIdToken(token);
+    if (!(await isSuperAdminUid(decoded.uid))) {
+      return res.status(403).json({ error: "Super Admin access required." });
+    }
     req.user = decoded;
     next();
   } catch (error) {
-    return res.status(401).json({ error: "Invalid or expired Firebase session." });
+    console.error("Authentication error:", error.message);
+    return res.status(401).json({ error: "Invalid or unauthorized Firebase session." });
   }
 }
 
@@ -239,11 +321,26 @@ function verifyCronSecret(req) {
 }
 
 const app = express();
-app.use(cors({ origin: true }));
+app.disable("x-powered-by");
+app.set("trust proxy", 1);
+
+app.use(cors({
+  origin(origin, callback) {
+    if (!origin || ALLOWED_ORIGINS.length === 0 || ALLOWED_ORIGINS.includes(origin)) return callback(null, true);
+    return callback(new Error("Origin not allowed by CORS."));
+  },
+  methods: ["GET", "POST"],
+  allowedHeaders: ["Content-Type", "Authorization", "X-Cron-Secret"]
+}));
 app.use(express.json({ limit: "1mb" }));
 
 app.get("/api/health", (_req, res) => {
-  res.json({ ok: true, service: "meat-uploaded-server", time: new Date().toISOString() });
+  res.json({
+    ok: true,
+    service: "meat-uploaded-server",
+    timezone: TZ,
+    time: new Date().toISOString()
+  });
 });
 
 app.post("/api/telegram/test", verifySuperAdmin, async (_req, res) => {
@@ -277,7 +374,6 @@ app.post("/api/telegram/webhook", async (req, res) => {
     const telegramSnap = await db.doc("telegram/primary").get();
     const configuredChatId = String(telegramSnap.data()?.chatId || "");
     const callbackChatId = String(callback.message?.chat?.id || "");
-
     if (!configuredChatId || configuredChatId !== callbackChatId) {
       return res.status(403).send("Unauthorized chat");
     }
@@ -286,6 +382,15 @@ app.post("/api/telegram/webhook", async (req, res) => {
     const postRef = db.doc(`posts/${postId}`);
     const postSnap = await postRef.get();
     if (!postSnap.exists) return res.status(404).send("Post not found");
+
+    const post = postSnap.data() || {};
+    if (post.status === "completed") {
+      await telegramRequest("answerCallbackQuery", {
+        callback_query_id: callback.id,
+        text: "This post is already completed."
+      });
+      return res.status(200).send("ok");
+    }
 
     await postRef.update({
       status: "completed",
@@ -325,7 +430,7 @@ app.post("/api/scheduler/run", async (req, res) => {
 });
 
 const distPath = path.join(__dirname, "dist");
-app.use(express.static(distPath));
+app.use(express.static(distPath, { maxAge: "1h", index: false }));
 app.get(/^(?!\/api\/).*/, (req, res, next) => {
   if (req.path.startsWith("/api/")) return next();
   res.sendFile(path.join(distPath, "index.html"), error => {
@@ -335,14 +440,14 @@ app.get(/^(?!\/api\/).*/, (req, res, next) => {
 
 async function runSchedulerOnce() {
   const result = await sendScheduledReminders();
-  console.log("Scheduler result:", result);
+  console.log("Scheduler result:", JSON.stringify(result));
 }
 
 if (process.argv.includes("--scheduler-once")) {
   runSchedulerOnce()
     .then(() => process.exit(0))
     .catch(error => {
-      console.error(error);
+      console.error("Scheduler fatal error:", error);
       process.exit(1);
     });
 } else {

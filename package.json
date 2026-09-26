@@ -1,16 +1,19 @@
 {
   "name": "meat-uploaded",
   "private": true,
-  "version": "2.0.0",
+  "version": "2.1.0",
   "type": "module",
-  "engines": { "node": ">=22 <23" },
+  "engines": {
+    "node": ">=22 <23"
+  },
   "scripts": {
     "dev": "vite",
     "server": "node server.js",
     "build": "vite build",
     "start": "node server.js",
     "scheduler": "node server.js --scheduler-once",
-    "preview": "vite preview"
+    "preview": "vite preview",
+    "bootstrap-admin": "node scripts/bootstrap-admin.mjs"
   },
   "dependencies": {
     "cors": "^2.8.5",
