@@ -12,7 +12,7 @@ jobs:
     steps:
       - name: Trigger scheduler
         run: |
-          curl -X POST \
-            -H "Authorization: Bearer ${{ secrets.CRON_SECRET }}" \
+          curl --fail-with-body -X POST \
+            -H "X-Cron-Secret: ${{ secrets.CRON_SECRET }}" \
             -H "Content-Type: application/json" \
             https://meta-upload-by-sagar.onrender.com/api/scheduler/run
